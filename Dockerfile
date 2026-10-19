@@ -6,11 +6,11 @@ COPY requirements.txt .
 
 RUN python -m pip install --no-cache-dir -r requirements.txt
 
-RUN mkdir app
+RUN mkdir /app
 WORKDIR /app
+
 COPY . /app
 
 EXPOSE 8000
 
-# No browser needed — Flashscore serves everything over plain HTTP.
-CMD ["python", "run.py"]
+CMD ["python", "railway_start.py"]

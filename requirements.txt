@@ -4,3 +4,5 @@ curl_cffi
 beautifulsoup4
 lxml
 marshmallow
+mcp==2.1.1
+httpx
