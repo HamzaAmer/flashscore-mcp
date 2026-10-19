@@ -479,6 +479,77 @@ def _raw_lineup_player_index(lineups: dict):
     return index, raw_side_sets
 
 
+def _entry_minutes_and_participation(entry: dict):
+    """Return conservative participation evidence from player-statistics."""
+    minutes_played = None
+    for stat in entry.get("statistics", []) or []:
+        name = _normalized(stat.get("name"))
+        if "minute" not in name:
+            continue
+        value = stat.get("numeric_value")
+        if value is None:
+            value = stat.get("value")
+        if isinstance(value, (int, float)):
+            minutes_played = value
+            break
+        try:
+            minutes_played = float(value)
+            break
+        except (TypeError, ValueError):
+            pass
+
+    if minutes_played is not None:
+        played = minutes_played > 0
+        participation = "played" if played else "unused"
+    elif entry.get("rating") is not None:
+        played = True
+        participation = "played"
+    else:
+        played = None
+        participation = "unknown"
+
+    return minutes_played, played, participation
+
+
+def _raw_side_validation(lineups: dict, player_stats: dict, home_team_id: str, away_team_id: str):
+    """Measure whether each raw lineup side actually belongs to the expected team."""
+    player_team = {}
+    for entry in player_stats.get("players", []) or []:
+        player = entry.get("player") or {}
+        team = entry.get("team") or {}
+        pid = player.get("id") if isinstance(player, dict) else None
+        tid = team.get("id") if isinstance(team, dict) else None
+        if pid and tid:
+            player_team[str(pid)] = str(tid)
+
+    validation = {}
+    for raw_side, expected_team_id in (("home", home_team_id), ("away", away_team_id)):
+        ids = []
+        payload = lineups.get(raw_side) or {}
+        for group in payload.get("groups", []) or []:
+            for item in group.get("players", []) or []:
+                player = item.get("player") or {}
+                pid = player.get("id") if isinstance(player, dict) else None
+                if pid:
+                    ids.append(str(pid))
+
+        matched = sum(1 for pid in ids if player_team.get(pid) == expected_team_id)
+        opposite_team_id = away_team_id if raw_side == "home" else home_team_id
+        opposite = sum(1 for pid in ids if player_team.get(pid) == opposite_team_id)
+        known = matched + opposite
+        purity = (matched / known) if known else 0.0
+
+        validation[raw_side] = {
+            "raw_player_count": len(ids),
+            "known_player_count": known,
+            "expected_team_matches": matched,
+            "opposite_team_matches": opposite,
+            "purity": round(purity, 3),
+        }
+
+    return validation
+
+
 def _authoritative_lineups(details: dict, lineups: dict, player_stats: dict):
     """
     Rebuild the two team lineups from player-statistics team IDs.
@@ -547,6 +618,8 @@ def _authoritative_lineups(details: dict, lineups: dict, player_stats: dict):
         if rating is None:
             rating = raw.get("rating")
 
+        minutes_played, played, participation = _entry_minutes_and_participation(entry)
+
         player = {
             "player": player_ref,
             "team": team_ref,
@@ -560,6 +633,9 @@ def _authoritative_lineups(details: dict, lineups: dict, player_stats: dict):
             "is_starter": entry.get("is_starter"),
             "rating": rating,
             "is_best_rated": entry.get("is_best_rated"),
+            "minutes_played": minutes_played,
+            "played": played,
+            "participation": participation,
             "raw_lineup_incident": raw.get("incident"),
         }
 
@@ -567,13 +643,25 @@ def _authoritative_lineups(details: dict, lineups: dict, player_stats: dict):
         rebuilt[side]["groups"][group_index]["players"].append(player)
         assigned[side] += 1
 
-    # Raw formation/team rating is safe only when the two raw sides are
-    # clearly different. If they are duplicates/near-duplicates, omit them.
     overlap = len(raw_side_sets["home"] & raw_side_sets["away"])
     smaller = min(len(raw_side_sets["home"]), len(raw_side_sets["away"])) or 1
     overlap_ratio = overlap / smaller
 
-    if overlap_ratio < 0.25:
+    raw_validation = _raw_side_validation(
+        lineups,
+        player_stats,
+        home_team_id,
+        away_team_id,
+    )
+    raw_sides_trustworthy = (
+        overlap_ratio < 0.25
+        and raw_validation["home"]["purity"] >= 0.90
+        and raw_validation["away"]["purity"] >= 0.90
+        and raw_validation["home"]["known_player_count"] >= 10
+        and raw_validation["away"]["known_player_count"] >= 10
+    )
+
+    if raw_sides_trustworthy:
         for side in ("home", "away"):
             raw_side = lineups.get(side) or {}
             rebuilt[side]["formation"] = raw_side.get("formation")
@@ -597,7 +685,9 @@ def _authoritative_lineups(details: dict, lineups: dict, player_stats: dict):
             "raw_away_player_count": len(raw_side_sets["away"]),
             "raw_side_overlap_count": overlap,
             "raw_side_overlap_ratio": round(overlap_ratio, 3),
-            "raw_formation_and_team_rating_used": overlap_ratio < 0.25,
+            "raw_side_validation": raw_validation,
+            "raw_sides_trustworthy": raw_sides_trustworthy,
+            "raw_formation_and_team_rating_used": raw_sides_trustworthy,
         },
         "mapping_note": (
             "home/away player membership is rebuilt from player-statistics "
@@ -606,10 +696,21 @@ def _authoritative_lineups(details: dict, lineups: dict, player_stats: dict):
     }
 
 
+def _score_from_description(description: str | None):
+    """Extract the last score token such as 2:4 from an incident description."""
+    if not description:
+        return None
+    matches = re.findall(r"(?<!\\d)(\\d{1,2})\\s*[:\\-]\\s*(\\d{1,2})(?!\\d)", str(description))
+    if not matches:
+        return None
+    home, away = matches[-1]
+    return {"home": int(home), "away": int(away)}
+
+
 def _normalize_match_summary(details: dict, summary: dict):
     """
     Attach authoritative team identity to incidents and surface score conflicts
-    instead of guessing when upstream period headers disagree with incidents.
+    instead of guessing when upstream period markers disagree with incidents.
     """
     home_team = details.get("home") or {}
     away_team = details.get("away") or {}
@@ -633,72 +734,71 @@ def _normalize_match_summary(details: dict, summary: dict):
                 item["team_id"] = None
                 item["team_name"] = None
 
+            parsed_score = _score_from_description(item.get("description"))
+            numeric_score = None
+            if item.get("home_score") is not None and item.get("away_score") is not None:
+                numeric_score = {
+                    "home": item.get("home_score"),
+                    "away": item.get("away_score"),
+                }
+
+            item["parsed_score_from_description"] = parsed_score
+            item["effective_score"] = numeric_score or parsed_score
             item["_period_index"] = period_index
             normalized_incidents.append(item)
             all_incidents.append(item)
 
         normalized_periods.append({
             "period": period.get("period"),
-            "raw_home_score_at_start": period.get("home_score_at_start"),
-            "raw_away_score_at_start": period.get("away_score_at_start"),
+            "raw_period_score_marker": {
+                "home": period.get("home_score_at_start"),
+                "away": period.get("away_score_at_start"),
+            },
             "incidents": normalized_incidents,
         })
 
-    # Derive the score observed at the end of each period from incidents only.
-    period_end_scores = []
+    period_checks = []
     for period in normalized_periods:
-        scored = [
-            i for i in period["incidents"]
-            if i.get("home_score") is not None and i.get("away_score") is not None
-        ]
+        scored = [i for i in period["incidents"] if i.get("effective_score")]
         last = scored[-1] if scored else None
-        period_end_scores.append({
+        period_checks.append({
             "period": period.get("period"),
-            "incident_derived_end_score": (
-                {
-                    "home": last.get("home_score"),
-                    "away": last.get("away_score"),
-                }
-                if last else None
-            ),
-            "raw_reported_score_at_period_header": {
-                "home": period.get("raw_home_score_at_start"),
-                "away": period.get("raw_away_score_at_start"),
-            },
+            "incident_derived_end_score": last.get("effective_score") if last else None,
+            "raw_period_score_marker": period.get("raw_period_score_marker"),
+            "marker_semantics": "unknown_upstream_marker",
         })
 
-    scored_incidents = [
-        i for i in all_incidents
-        if i.get("home_score") is not None and i.get("away_score") is not None
-    ]
+    scored_incidents = [i for i in all_incidents if i.get("effective_score")]
     last_incident = scored_incidents[-1] if scored_incidents else None
 
     final_score = {
         "home": details.get("home_score"),
         "away": details.get("away_score"),
     }
-    incident_last_score = (
-        {
-            "home": last_incident.get("home_score"),
-            "away": last_incident.get("away_score"),
-        }
-        if last_incident else None
-    )
+    incident_last_score = last_incident.get("effective_score") if last_incident else None
 
     warnings = []
-    if incident_last_score and incident_last_score != final_score:
+
+    if not scored_incidents:
         warnings.append(
-            "Incident list does not reach the official final score; one or more "
-            "scoring incidents may be missing."
+            "Incident score fields are empty and no score tokens could be parsed "
+            "from descriptions; the score timeline cannot be verified."
+        )
+    elif incident_last_score != final_score:
+        warnings.append(
+            "Incident-derived score timeline does not reach the official final "
+            "score; one or more scoring incidents may be missing or malformed."
         )
 
-    if len(period_end_scores) >= 2:
-        first_end = period_end_scores[0].get("incident_derived_end_score")
-        second_header = period_end_scores[1].get("raw_reported_score_at_period_header")
-        if first_end and second_header and first_end != second_header:
+    for check in period_checks:
+        marker = check.get("raw_period_score_marker")
+        derived = check.get("incident_derived_end_score")
+        if marker and derived and marker != derived:
             warnings.append(
-                "First-half incident-derived score conflicts with the raw "
-                "second-period header score. Do not infer halftime score."
+                f"Raw period score marker for {check.get('period') or 'unknown period'} "
+                "conflicts with the incident-derived end score. The upstream marker "
+                "semantics are unreliable, so it must not be treated as a period-start "
+                "or halftime score."
             )
 
     return {
@@ -707,14 +807,16 @@ def _normalize_match_summary(details: dict, summary: dict):
         "away_team": away_team,
         "final_score": final_score,
         "periods": normalized_periods,
-        "period_score_checks": period_end_scores,
+        "period_score_checks": period_checks,
         "incident_last_score": incident_last_score,
-        "score_consistent_with_final": incident_last_score == final_score if incident_last_score else None,
+        "score_consistent_with_final": (
+            incident_last_score == final_score if incident_last_score else None
+        ),
         "data_quality_warnings": warnings,
         "usage_note": (
-            "Use incident team_id/team_name for event ownership. "
-            "Do not treat raw period header scores as authoritative when "
-            "data_quality_warnings reports a conflict."
+            "Use incident team_id/team_name for event ownership and effective_score "
+            "for score progression when present. raw_period_score_marker is an "
+            "untrusted upstream value with unknown semantics."
         ),
     }
 
