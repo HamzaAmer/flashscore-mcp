@@ -696,6 +696,33 @@ def _authoritative_lineups(details: dict, lineups: dict, player_stats: dict):
     }
 
 
+def _is_goal_incident(incident: dict) -> bool:
+    """
+    Conservatively identify scoring incidents.
+
+    The Flashscore summary feed sometimes leaves home_score/away_score empty,
+    but its incident type/description still identifies goals. Exclude obvious
+    non-scoring goal-related events such as disallowed or missed goals.
+    """
+    text = " ".join(
+        str(incident.get(key) or "")
+        for key in ("type", "reason", "description")
+    )
+    normalized = _normalized(text)
+
+    if any(token in normalized for token in (
+        "disallowed",
+        "no goal",
+        "goal cancelled",
+        "goal canceled",
+        "missed penalty",
+        "penalty missed",
+    )):
+        return False
+
+    return "goal" in normalized
+
+
 def _score_from_description(description: str | None):
     """Extract the last score token such as 2:4 from an incident description."""
     if not description:
@@ -709,17 +736,20 @@ def _score_from_description(description: str | None):
 
 def _normalize_match_summary(details: dict, summary: dict):
     """
-    Attach authoritative team identity to incidents and surface score conflicts
-    instead of guessing when upstream period markers disagree with incidents.
+    Attach authoritative team identity to incidents and derive a conservative
+    score timeline. When raw score fields are missing, count goal incidents by
+    authoritative team side instead of trusting ambiguous period markers.
     """
     home_team = details.get("home") or {}
     away_team = details.get("away") or {}
 
     normalized_periods = []
     all_incidents = []
+    running_score = {"home": 0, "away": 0}
 
     for period_index, period in enumerate(summary.get("periods", []) or []):
         normalized_incidents = []
+
         for incident in period.get("incidents", []) or []:
             item = dict(incident)
             raw_side = item.get("team")
@@ -734,7 +764,6 @@ def _normalize_match_summary(details: dict, summary: dict):
                 item["team_id"] = None
                 item["team_name"] = None
 
-            parsed_score = _score_from_description(item.get("description"))
             numeric_score = None
             if item.get("home_score") is not None and item.get("away_score") is not None:
                 numeric_score = {
@@ -742,9 +771,24 @@ def _normalize_match_summary(details: dict, summary: dict):
                     "away": item.get("away_score"),
                 }
 
+            parsed_score = _score_from_description(item.get("description"))
+            is_goal = _is_goal_incident(item)
+
+            derived_score = None
+            if is_goal and raw_side in ("home", "away"):
+                running_score[raw_side] += 1
+                derived_score = dict(running_score)
+
+            # Prefer an explicit upstream score, then a score token in the
+            # description, and finally our goal-count reconstruction.
+            effective_score = numeric_score or parsed_score or derived_score
+
+            item["is_goal"] = is_goal
             item["parsed_score_from_description"] = parsed_score
-            item["effective_score"] = numeric_score or parsed_score
+            item["derived_score_from_goal_count"] = derived_score
+            item["effective_score"] = effective_score
             item["_period_index"] = period_index
+
             normalized_incidents.append(item)
             all_incidents.append(item)
 
@@ -754,51 +798,56 @@ def _normalize_match_summary(details: dict, summary: dict):
                 "home": period.get("home_score_at_start"),
                 "away": period.get("away_score_at_start"),
             },
+            "incident_derived_end_score": dict(running_score),
             "incidents": normalized_incidents,
         })
 
     period_checks = []
     for period in normalized_periods:
-        scored = [i for i in period["incidents"] if i.get("effective_score")]
-        last = scored[-1] if scored else None
         period_checks.append({
             "period": period.get("period"),
-            "incident_derived_end_score": last.get("effective_score") if last else None,
+            "incident_derived_end_score": period.get("incident_derived_end_score"),
             "raw_period_score_marker": period.get("raw_period_score_marker"),
             "marker_semantics": "unknown_upstream_marker",
         })
-
-    scored_incidents = [i for i in all_incidents if i.get("effective_score")]
-    last_incident = scored_incidents[-1] if scored_incidents else None
 
     final_score = {
         "home": details.get("home_score"),
         "away": details.get("away_score"),
     }
-    incident_last_score = last_incident.get("effective_score") if last_incident else None
+
+    incident_last_score = dict(running_score) if all_incidents else None
+    goal_incident_count = sum(1 for i in all_incidents if i.get("is_goal"))
 
     warnings = []
 
-    if not scored_incidents:
+    if goal_incident_count == 0:
         warnings.append(
-            "Incident score fields are empty and no score tokens could be parsed "
-            "from descriptions; the score timeline cannot be verified."
+            "No scoring incidents could be identified, so the score timeline "
+            "cannot be reconstructed from the incident feed."
         )
     elif incident_last_score != final_score:
         warnings.append(
-            "Incident-derived score timeline does not reach the official final "
-            "score; one or more scoring incidents may be missing or malformed."
+            "Goal-count reconstruction does not reach the official final score; "
+            "one or more scoring incidents may be missing, duplicated or "
+            "misclassified."
         )
 
     for check in period_checks:
         marker = check.get("raw_period_score_marker")
         derived = check.get("incident_derived_end_score")
-        if marker and derived and marker != derived:
+        if (
+            marker
+            and derived
+            and marker.get("home") is not None
+            and marker.get("away") is not None
+            and marker != derived
+        ):
             warnings.append(
                 f"Raw period score marker for {check.get('period') or 'unknown period'} "
-                "conflicts with the incident-derived end score. The upstream marker "
-                "semantics are unreliable, so it must not be treated as a period-start "
-                "or halftime score."
+                "conflicts with the goal-incident-derived score. The upstream "
+                "marker semantics are unreliable and must not be treated as a "
+                "period-start or halftime score."
             )
 
     return {
@@ -808,15 +857,17 @@ def _normalize_match_summary(details: dict, summary: dict):
         "final_score": final_score,
         "periods": normalized_periods,
         "period_score_checks": period_checks,
+        "goal_incident_count": goal_incident_count,
         "incident_last_score": incident_last_score,
         "score_consistent_with_final": (
             incident_last_score == final_score if incident_last_score else None
         ),
         "data_quality_warnings": warnings,
         "usage_note": (
-            "Use incident team_id/team_name for event ownership and effective_score "
-            "for score progression when present. raw_period_score_marker is an "
-            "untrusted upstream value with unknown semantics."
+            "Use incident team_id/team_name for event ownership. When explicit "
+            "incident score fields are absent, derived_score_from_goal_count and "
+            "incident_derived_end_score are reconstructed by counting goal "
+            "incidents. raw_period_score_marker remains untrusted upstream data."
         ),
     }
 
