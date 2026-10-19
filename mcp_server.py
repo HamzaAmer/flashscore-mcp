@@ -127,6 +127,13 @@ async def _resolve_team(name: str, country: str | None = None):
 
 
 def _flatten_team_results(data: dict):
+    """
+    Flatten competition groups back into one chronological list.
+
+    Flashscore groups team results by competition, which destroys the global
+    newest-first order. Re-sort after flattening so "last N matches" really
+    means the last N across all competitions.
+    """
     matches = []
     for group in data.get("competitions", []) or []:
         competition = group.get("competition") or {}
@@ -134,6 +141,15 @@ def _flatten_team_results(data: dict):
             item = dict(match)
             item["competition"] = competition
             matches.append(item)
+
+    matches.sort(
+        key=lambda item: (
+            item.get("start_time") or "",
+            item.get("date") or "",
+            item.get("id") or "",
+        ),
+        reverse=True,
+    )
     return matches
 
 
@@ -143,10 +159,42 @@ def _ref_name(ref):
     return ref
 
 
-def _compact_match(match: dict):
+def _compact_match(match: dict, team_id: str | None = None):
     competition = match.get("competition") or {}
     home = match.get("home") or {}
     away = match.get("away") or {}
+
+    home_id = home.get("id") if isinstance(home, dict) else None
+    away_id = away.get("id") if isinstance(away, dict) else None
+
+    team_side = None
+    if team_id and _normalized(home_id) == _normalized(team_id):
+        team_side = "home"
+    elif team_id and _normalized(away_id) == _normalized(team_id):
+        team_side = "away"
+
+    home_score = match.get("home_score")
+    away_score = match.get("away_score")
+    result = None
+    team_score = None
+    opponent_score = None
+    opponent = None
+    opponent_id = None
+
+    if team_side == "home":
+        team_score, opponent_score = home_score, away_score
+        opponent, opponent_id = _ref_name(away), away_id
+    elif team_side == "away":
+        team_score, opponent_score = away_score, home_score
+        opponent, opponent_id = _ref_name(home), home_id
+
+    if team_score is not None and opponent_score is not None:
+        if team_score > opponent_score:
+            result = "win"
+        elif team_score < opponent_score:
+            result = "loss"
+        else:
+            result = "draw"
 
     return {
         "id": match.get("id"),
@@ -157,11 +205,17 @@ def _compact_match(match: dict):
         "status": match.get("status"),
         "home": _ref_name(home),
         "away": _ref_name(away),
-        "home_team_id": home.get("id") if isinstance(home, dict) else None,
-        "away_team_id": away.get("id") if isinstance(away, dict) else None,
-        "home_score": match.get("home_score"),
-        "away_score": match.get("away_score"),
+        "home_team_id": home_id,
+        "away_team_id": away_id,
+        "home_score": home_score,
+        "away_score": away_score,
         "winner": match.get("winner"),
+        "team_side": team_side,
+        "opponent": opponent,
+        "opponent_team_id": opponent_id,
+        "team_score": team_score,
+        "opponent_score": opponent_score,
+        "result": result,
         "has_statistics": bool(match.get("has_statistics")),
     }
 
@@ -187,11 +241,17 @@ def _pick_match_period(stat_data: dict):
     return periods[0]
 
 
-def _compact_match_statistics(stat_data: dict):
+def _compact_match_statistics(stat_data: dict, team_side: str | None = None):
+    """
+    Compact match statistics and, when possible, normalize them to
+    team/opponent orientation. This prevents clients from accidentally
+    reversing home/away values for away matches.
+    """
     period = _pick_match_period(stat_data)
     if not period:
         return {
             "period": None,
+            "team_side": team_side,
             "statistics": {},
         }
 
@@ -203,15 +263,38 @@ def _compact_match_statistics(stat_data: dict):
             if not any(keyword in normalized_name for keyword in MATCH_STAT_KEYWORDS):
                 continue
 
-            compact[name or stat.get("id") or "unknown"] = {
-                "home": stat.get("home"),
-                "away": stat.get("away"),
-                "home_value": stat.get("home_value"),
-                "away_value": stat.get("away_value"),
+            home = stat.get("home")
+            away = stat.get("away")
+            home_value = stat.get("home_value")
+            away_value = stat.get("away_value")
+
+            row = {
+                "home": home,
+                "away": away,
+                "home_value": home_value,
+                "away_value": away_value,
             }
+
+            if team_side == "home":
+                row.update({
+                    "team": home,
+                    "opponent": away,
+                    "team_value": home_value,
+                    "opponent_value": away_value,
+                })
+            elif team_side == "away":
+                row.update({
+                    "team": away,
+                    "opponent": home,
+                    "team_value": away_value,
+                    "opponent_value": home_value,
+                })
+
+            compact[name or stat.get("id") or "unknown"] = row
 
     return {
         "period": period.get("period"),
+        "team_side": team_side,
         "statistics": compact,
     }
 
@@ -442,7 +525,7 @@ async def analyze_team_recent_matches(
     recent = _flatten_team_results(results_data)[:match_limit]
 
     async def enrich_match(match):
-        compact = _compact_match(match)
+        compact = _compact_match(match, team_id=team_id)
 
         if not match.get("has_statistics") or not match.get("id"):
             compact["statistics"] = None
@@ -453,7 +536,10 @@ async def analyze_team_recent_matches(
                 "/matches/statistics",
                 {"match": match.get("id")},
             )
-            compact["statistics"] = _compact_match_statistics(raw_stats)
+            compact["statistics"] = _compact_match_statistics(
+                raw_stats,
+                team_side=compact.get("team_side"),
+            )
         except Exception as exc:
             compact["statistics"] = {
                 "error": type(exc).__name__,
@@ -496,7 +582,10 @@ async def analyze_team_recent_matches(
         "recent_matches": enriched_matches,
         "latest_match_player_statistics": latest_players,
         "analysis_note": (
-            "Use recent_matches for team-level tactical trends and "
+            "recent_matches is sorted newest-first across ALL competitions. "
+            "For each match, team_score/opponent_score and every statistic's "
+            "team/opponent fields are already normalized to the resolved team, "
+            "so do not infer orientation from home/away. Use "
             "latest_match_player_statistics for the latest-match player view."
         ),
     }
