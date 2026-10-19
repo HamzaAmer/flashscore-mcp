@@ -1,4 +1,7 @@
+import asyncio
 import os
+import re
+
 import httpx
 
 from mcp.server.mcpserver import MCPServer
@@ -13,6 +16,53 @@ FLASHSCORE_BASE_URL = os.getenv(
 
 PORT = int(os.getenv("PORT", "3001"))
 
+PLAYER_STAT_KEYWORDS = (
+    "minute",
+    "goal",
+    "assist",
+    "shot",
+    "expected goal",
+    "xg",
+    "expected assist",
+    "xa",
+    "pass",
+    "chance",
+    "touch",
+    "tackle",
+    "interception",
+    "recover",
+    "duel",
+    "dribble",
+    "clearance",
+    "block",
+    "save",
+    "foul",
+    "offside",
+    "possession",
+)
+
+MATCH_STAT_KEYWORDS = (
+    "expected goal",
+    "xg",
+    "possession",
+    "shot",
+    "big chance",
+    "pass",
+    "touch",
+    "expected assist",
+    "xa",
+    "corner",
+    "foul",
+    "yellow",
+    "red",
+    "offside",
+    "save",
+    "tackle",
+    "interception",
+    "recover",
+    "duel",
+)
+
 
 async def flashscore_get(path: str, params: dict | None = None):
     async with httpx.AsyncClient(timeout=60.0) as client:
@@ -22,6 +72,227 @@ async def flashscore_get(path: str, params: dict | None = None):
         )
         response.raise_for_status()
         return response.json()
+
+
+def _normalized(value: str | None) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip().casefold())
+
+
+def _team_candidates(search_data: dict, name: str, country: str | None = None):
+    wanted_name = _normalized(name)
+    wanted_country = _normalized(country)
+
+    candidates = []
+    for item in search_data.get("results", []):
+        if item.get("type") != "team":
+            continue
+        if item.get("sport", {}).get("slug") != "football":
+            continue
+
+        item_name = _normalized(item.get("name"))
+        item_country = _normalized(item.get("country", {}).get("name"))
+        gender = _normalized(item.get("gender"))
+
+        score = 0
+        if item_name == wanted_name:
+            score += 100
+        elif item_name.startswith(wanted_name) or wanted_name.startswith(item_name):
+            score += 50
+        elif wanted_name in item_name:
+            score += 25
+
+        if wanted_country:
+            if item_country == wanted_country:
+                score += 40
+            else:
+                score -= 20
+
+        if gender == "men":
+            score += 5
+
+        candidates.append((score, item))
+
+    candidates.sort(key=lambda pair: pair[0], reverse=True)
+    return [item for _, item in candidates]
+
+
+async def _resolve_team(name: str, country: str | None = None):
+    data = await flashscore_get("/search", {"query": name})
+    candidates = _team_candidates(data, name, country)
+
+    if not candidates:
+        return None, []
+
+    return candidates[0], candidates[:5]
+
+
+def _flatten_team_results(data: dict):
+    matches = []
+    for group in data.get("competitions", []) or []:
+        competition = group.get("competition") or {}
+        for match in group.get("matches", []) or []:
+            item = dict(match)
+            item["competition"] = competition
+            matches.append(item)
+    return matches
+
+
+def _ref_name(ref):
+    if isinstance(ref, dict):
+        return ref.get("name")
+    return ref
+
+
+def _compact_match(match: dict):
+    competition = match.get("competition") or {}
+    home = match.get("home") or {}
+    away = match.get("away") or {}
+
+    return {
+        "id": match.get("id"),
+        "date": match.get("date"),
+        "start_time": match.get("start_time"),
+        "competition": competition.get("name"),
+        "round": match.get("round"),
+        "status": match.get("status"),
+        "home": _ref_name(home),
+        "away": _ref_name(away),
+        "home_team_id": home.get("id") if isinstance(home, dict) else None,
+        "away_team_id": away.get("id") if isinstance(away, dict) else None,
+        "home_score": match.get("home_score"),
+        "away_score": match.get("away_score"),
+        "winner": match.get("winner"),
+        "has_statistics": bool(match.get("has_statistics")),
+    }
+
+
+def _pick_match_period(stat_data: dict):
+    periods = stat_data.get("periods", []) or []
+    if not periods:
+        return None
+
+    preferred = (
+        "match",
+        "full time",
+        "full-time",
+        "90 minutes",
+        "overall",
+    )
+
+    for wanted in preferred:
+        for period in periods:
+            if _normalized(period.get("period")) == wanted:
+                return period
+
+    return periods[0]
+
+
+def _compact_match_statistics(stat_data: dict):
+    period = _pick_match_period(stat_data)
+    if not period:
+        return {
+            "period": None,
+            "statistics": {},
+        }
+
+    compact = {}
+    for group in period.get("groups", []) or []:
+        for stat in group.get("statistics", []) or []:
+            name = stat.get("name")
+            normalized_name = _normalized(name)
+            if not any(keyword in normalized_name for keyword in MATCH_STAT_KEYWORDS):
+                continue
+
+            compact[name or stat.get("id") or "unknown"] = {
+                "home": stat.get("home"),
+                "away": stat.get("away"),
+                "home_value": stat.get("home_value"),
+                "away_value": stat.get("away_value"),
+            }
+
+    return {
+        "period": period.get("period"),
+        "statistics": compact,
+    }
+
+
+def _compact_player_entry(player_entry: dict):
+    player = player_entry.get("player") or {}
+    team = player_entry.get("team") or {}
+
+    selected_stats = {}
+    for stat in player_entry.get("statistics", []) or []:
+        name = stat.get("name")
+        normalized_name = _normalized(name)
+        if not any(keyword in normalized_name for keyword in PLAYER_STAT_KEYWORDS):
+            continue
+
+        selected_stats[name or stat.get("id") or "unknown"] = (
+            stat.get("numeric_value")
+            if stat.get("numeric_value") is not None
+            else stat.get("value")
+        )
+
+        if len(selected_stats) >= 24:
+            break
+
+    return {
+        "player_id": player.get("id") if isinstance(player, dict) else None,
+        "name": player.get("name") if isinstance(player, dict) else player,
+        "team_id": team.get("id") if isinstance(team, dict) else None,
+        "team": team.get("name") if isinstance(team, dict) else team,
+        "side": player_entry.get("side"),
+        "position": player_entry.get("position"),
+        "is_goalkeeper": player_entry.get("is_goalkeeper"),
+        "is_starter": player_entry.get("is_starter"),
+        "rating": player_entry.get("rating"),
+        "is_best_rated": player_entry.get("is_best_rated"),
+        "statistics": selected_stats,
+    }
+
+
+def _compact_player_statistics(
+    data: dict,
+    team_id: str | None = None,
+    team_name: str | None = None,
+    max_players: int = 20,
+):
+    wanted_team_id = _normalized(team_id)
+    wanted_team_name = _normalized(team_name)
+
+    selected = []
+    for entry in data.get("players", []) or []:
+        team = entry.get("team") or {}
+        current_team_id = _normalized(team.get("id") if isinstance(team, dict) else None)
+        current_team_name = _normalized(team.get("name") if isinstance(team, dict) else team)
+
+        if wanted_team_id and current_team_id != wanted_team_id:
+            continue
+        if not wanted_team_id and wanted_team_name and current_team_name != wanted_team_name:
+            continue
+
+        selected.append(_compact_player_entry(entry))
+
+    selected.sort(
+        key=lambda item: (
+            item.get("is_starter") is not True,
+            -(item.get("rating") or 0),
+            item.get("name") or "",
+        )
+    )
+
+    selected = selected[:max(1, min(max_players, 25))]
+
+    return {
+        "match_id": data.get("id"),
+        "date": data.get("date"),
+        "home_score": data.get("home_score"),
+        "away_score": data.get("away_score"),
+        "team_id": team_id,
+        "team_name": team_name,
+        "player_count": len(selected),
+        "players": selected,
+    }
 
 
 @mcp.tool()
@@ -34,20 +305,10 @@ def ping() -> str:
 async def search_team(name: str):
     """
     Search for football teams by name.
+    Returns only football teams and ranks exact name matches first.
     """
-    data = await flashscore_get(
-        "/search",
-        {"query": name},
-    )
-
-    results = []
-
-    for item in data.get("results", []):
-        if (
-            item.get("type") == "team"
-            and item.get("sport", {}).get("slug") == "football"
-        ):
-            results.append(item)
+    data = await flashscore_get("/search", {"query": name})
+    results = _team_candidates(data, name)
 
     return {
         "query": name,
@@ -114,14 +375,131 @@ async def get_match_statistics(match_id: str):
 
 
 @mcp.tool()
-async def get_match_player_statistics(match_id: str):
-    """Get detailed player statistics and ratings."""
-    return await flashscore_get(
+async def get_match_player_statistics(
+    match_id: str,
+    team_id: str | None = None,
+    team_name: str | None = None,
+    max_players: int = 20,
+):
+    """
+    Get compact player statistics and ratings for a match.
+
+    Optional team_id or team_name filters the response to one team, which is
+    strongly recommended to avoid oversized responses. Only analysis-relevant
+    statistics are returned for each player.
+    """
+    data = await flashscore_get(
         "/matches/player-statistics",
         {
             "match": match_id,
         },
     )
+
+    return _compact_player_statistics(
+        data,
+        team_id=team_id,
+        team_name=team_name,
+        max_players=max_players,
+    )
+
+
+@mcp.tool()
+async def analyze_team_recent_matches(
+    team_name: str,
+    matches: int = 5,
+    country: str | None = None,
+):
+    """
+    Build a compact analysis dataset for a team's recent matches.
+
+    Resolves the team name automatically, fetches the most recent results,
+    adds key full-time match statistics for each selected match, and includes
+    compact player statistics for the most recent match when available.
+    The returned payload is intentionally bounded so Claude can analyze it
+    without truncation.
+    """
+    match_limit = max(1, min(int(matches), 5))
+
+    team, alternatives = await _resolve_team(team_name, country)
+    if not team:
+        return {
+            "error": "team_not_found",
+            "query": team_name,
+            "country": country,
+        }
+
+    team_id = team.get("id")
+    resolved_name = team.get("name")
+
+    results_data = await flashscore_get(
+        "/teams/results",
+        {
+            "team": team_id,
+            "page": 1,
+        },
+    )
+
+    recent = _flatten_team_results(results_data)[:match_limit]
+
+    async def enrich_match(match):
+        compact = _compact_match(match)
+
+        if not match.get("has_statistics") or not match.get("id"):
+            compact["statistics"] = None
+            return compact
+
+        try:
+            raw_stats = await flashscore_get(
+                "/matches/statistics",
+                {"match": match.get("id")},
+            )
+            compact["statistics"] = _compact_match_statistics(raw_stats)
+        except Exception as exc:
+            compact["statistics"] = {
+                "error": type(exc).__name__,
+            }
+
+        return compact
+
+    enriched_matches = await asyncio.gather(
+        *(enrich_match(match) for match in recent)
+    )
+
+    latest_players = None
+    if recent and recent[0].get("id"):
+        try:
+            raw_players = await flashscore_get(
+                "/matches/player-statistics",
+                {"match": recent[0].get("id")},
+            )
+            latest_players = _compact_player_statistics(
+                raw_players,
+                team_id=team_id,
+                team_name=resolved_name,
+                max_players=20,
+            )
+        except Exception as exc:
+            latest_players = {
+                "error": type(exc).__name__,
+                "match_id": recent[0].get("id"),
+            }
+
+    return {
+        "query": {
+            "team_name": team_name,
+            "country": country,
+            "matches": match_limit,
+        },
+        "resolved_team": team,
+        "alternative_matches": alternatives[1:],
+        "recent_match_count": len(enriched_matches),
+        "recent_matches": enriched_matches,
+        "latest_match_player_statistics": latest_players,
+        "analysis_note": (
+            "Use recent_matches for team-level tactical trends and "
+            "latest_match_player_statistics for the latest-match player view."
+        ),
+    }
 
 
 if __name__ == "__main__":
