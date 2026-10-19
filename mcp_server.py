@@ -402,6 +402,335 @@ def _compact_player_statistics(
     }
 
 
+def _to_number(value):
+    if isinstance(value, (int, float)):
+        return float(value)
+    if value is None:
+        return None
+    text = str(value).strip().replace("%", "").replace(",", "")
+    match = re.search(r"-?\d+(?:\.\d+)?", text)
+    return float(match.group()) if match else None
+
+
+def _stat_lookup(compact_statistics: dict | None, keywords: tuple[str, ...]):
+    if not compact_statistics:
+        return None, None
+    stats = compact_statistics.get("statistics") or {}
+    for name, row in stats.items():
+        normalized = _normalized(name)
+        if all(keyword in normalized for keyword in keywords):
+            return _to_number(row.get("team")), _to_number(row.get("opponent"))
+    return None, None
+
+
+def _aggregate_team_form(matches: list[dict]):
+    completed = [m for m in matches if m.get("team_score") is not None and m.get("opponent_score") is not None]
+    if not completed:
+        return {
+            "matches": 0,
+            "wins": 0,
+            "draws": 0,
+            "losses": 0,
+        }
+
+    wins = sum(1 for m in completed if m.get("result") == "win")
+    draws = sum(1 for m in completed if m.get("result") == "draw")
+    losses = sum(1 for m in completed if m.get("result") == "loss")
+    goals_for = sum(float(m.get("team_score") or 0) for m in completed)
+    goals_against = sum(float(m.get("opponent_score") or 0) for m in completed)
+
+    buckets = {
+        "xg_for": [],
+        "xg_against": [],
+        "possession": [],
+        "shots_for": [],
+        "shots_against": [],
+        "shots_on_target_for": [],
+        "shots_on_target_against": [],
+        "big_chances_for": [],
+        "big_chances_against": [],
+        "pass_accuracy": [],
+    }
+
+    for match in completed:
+        stats = match.get("statistics")
+        pairs = {
+            "xg": _stat_lookup(stats, ("expected goal",)),
+            "possession": _stat_lookup(stats, ("possession",)),
+            "shots": _stat_lookup(stats, ("total attempts",)),
+            "shots_alt": _stat_lookup(stats, ("shots",)),
+            "shots_on_target": _stat_lookup(stats, ("shots on target",)),
+            "big_chances": _stat_lookup(stats, ("big chances",)),
+            "pass_accuracy": _stat_lookup(stats, ("passes",)),
+        }
+
+        xgf, xga = pairs["xg"]
+        if xgf is None:
+            xgf, xga = _stat_lookup(stats, ("xg",))
+        if xgf is not None:
+            buckets["xg_for"].append(xgf)
+            buckets["xg_against"].append(xga or 0)
+
+        pf, _ = pairs["possession"]
+        if pf is not None:
+            buckets["possession"].append(pf)
+
+        sf, sa = pairs["shots"]
+        if sf is None:
+            sf, sa = pairs["shots_alt"]
+        if sf is not None:
+            buckets["shots_for"].append(sf)
+            buckets["shots_against"].append(sa or 0)
+
+        sotf, sota = pairs["shots_on_target"]
+        if sotf is not None:
+            buckets["shots_on_target_for"].append(sotf)
+            buckets["shots_on_target_against"].append(sota or 0)
+
+        bcf, bca = pairs["big_chances"]
+        if bcf is not None:
+            buckets["big_chances_for"].append(bcf)
+            buckets["big_chances_against"].append(bca or 0)
+
+        paf, _ = pairs["pass_accuracy"]
+        if paf is not None:
+            buckets["pass_accuracy"].append(paf)
+
+    def avg(values):
+        return round(sum(values) / len(values), 2) if values else None
+
+    return {
+        "matches": len(completed),
+        "wins": wins,
+        "draws": draws,
+        "losses": losses,
+        "points_per_match": round((wins * 3 + draws) / len(completed), 2),
+        "goals_for": goals_for,
+        "goals_against": goals_against,
+        "goals_for_per_match": round(goals_for / len(completed), 2),
+        "goals_against_per_match": round(goals_against / len(completed), 2),
+        "goal_difference_per_match": round((goals_for - goals_against) / len(completed), 2),
+        "avg_xg_for": avg(buckets["xg_for"]),
+        "avg_xg_against": avg(buckets["xg_against"]),
+        "avg_possession": avg(buckets["possession"]),
+        "avg_shots_for": avg(buckets["shots_for"]),
+        "avg_shots_against": avg(buckets["shots_against"]),
+        "avg_shots_on_target_for": avg(buckets["shots_on_target_for"]),
+        "avg_shots_on_target_against": avg(buckets["shots_on_target_against"]),
+        "avg_big_chances_for": avg(buckets["big_chances_for"]),
+        "avg_big_chances_against": avg(buckets["big_chances_against"]),
+        "avg_pass_accuracy": avg(buckets["pass_accuracy"]),
+    }
+
+
+def _profile_strengths_weaknesses(form: dict):
+    strengths = []
+    weaknesses = []
+
+    if (form.get("points_per_match") or 0) >= 2.2:
+        strengths.append("strong recent results")
+    if (form.get("goals_for_per_match") or 0) >= 2.0:
+        strengths.append("high scoring output")
+    if form.get("avg_xg_for") is not None and form["avg_xg_for"] >= 2.0:
+        strengths.append("creates high-quality chances consistently")
+    if form.get("avg_possession") is not None and form["avg_possession"] >= 60:
+        strengths.append("controls possession and territory")
+    if form.get("avg_shots_for") is not None and form["avg_shots_for"] >= 16:
+        strengths.append("sustains attacking shot volume")
+    if form.get("avg_big_chances_for") is not None and form["avg_big_chances_for"] >= 3:
+        strengths.append("creates frequent big chances")
+    if (form.get("goals_against_per_match") or 99) <= 1.0:
+        strengths.append("limits goals conceded")
+    if form.get("avg_xg_against") is not None and form["avg_xg_against"] <= 1.0:
+        strengths.append("suppresses opponent chance quality")
+
+    if (form.get("goals_against_per_match") or 0) >= 1.6:
+        weaknesses.append("concedes too frequently")
+    if form.get("avg_xg_against") is not None and form["avg_xg_against"] >= 1.5:
+        weaknesses.append("allows too much expected-goal threat")
+    if form.get("avg_shots_against") is not None and form["avg_shots_against"] >= 13:
+        weaknesses.append("allows high opponent shot volume")
+    if form.get("avg_big_chances_against") is not None and form["avg_big_chances_against"] >= 2.5:
+        weaknesses.append("vulnerable to big chances")
+    if form.get("avg_possession") is not None and form["avg_possession"] <= 45:
+        weaknesses.append("often plays without the ball")
+    if form.get("points_per_match") is not None and form["points_per_match"] <= 1.2:
+        weaknesses.append("weak recent results")
+
+    return {
+        "strengths": strengths,
+        "weaknesses": weaknesses,
+    }
+
+
+def _key_players_from_compact(data: dict | None, limit: int = 6):
+    if not data:
+        return []
+    players = [p for p in (data.get("players") or []) if p.get("played") is not False]
+    players.sort(
+        key=lambda p: (
+            -(p.get("rating") or 0),
+            -(p.get("minutes_played") or 0),
+            p.get("name") or "",
+        )
+    )
+    return players[:limit]
+
+
+def _find_direct_fixture(fixtures_a: dict, fixtures_b: dict, team_a_id: str, team_b_id: str):
+    candidates = []
+    seen = set()
+
+    for payload in (fixtures_a, fixtures_b):
+        for match in _flatten_team_results(payload):
+            match_id = match.get("id")
+            if not match_id or match_id in seen:
+                continue
+            seen.add(match_id)
+
+            home = match.get("home") or {}
+            away = match.get("away") or {}
+            ids = {
+                str(home.get("id") if isinstance(home, dict) else ""),
+                str(away.get("id") if isinstance(away, dict) else ""),
+            }
+
+            if str(team_a_id) in ids and str(team_b_id) in ids:
+                candidates.append(match)
+
+    candidates.sort(
+        key=lambda m: (
+            m.get("start_time") or "9999",
+            m.get("date") or "9999",
+        )
+    )
+    return candidates[0] if candidates else None
+
+
+def _prediction_score(form: dict):
+    ppg = form.get("points_per_match") or 0
+    gd = form.get("goal_difference_per_match") or 0
+    xgd = 0
+    if form.get("avg_xg_for") is not None and form.get("avg_xg_against") is not None:
+        xgd = form["avg_xg_for"] - form["avg_xg_against"]
+    shot_edge = 0
+    if form.get("avg_shots_for") is not None and form.get("avg_shots_against") is not None:
+        shot_edge = (form["avg_shots_for"] - form["avg_shots_against"]) / 10
+
+    return (ppg * 0.9) + (gd * 0.7) + (xgd * 0.8) + (shot_edge * 0.3)
+
+
+def _prediction_probabilities(score_a: float, score_b: float, home_side: str | None):
+    if home_side == "a":
+        score_a += 0.20
+    elif home_side == "b":
+        score_b += 0.20
+
+    diff = score_a - score_b
+    draw = max(0.16, min(0.32, 0.28 - abs(diff) * 0.035))
+    remaining = 1.0 - draw
+
+    # Smooth deterministic conversion from score gap to win shares.
+    import math
+    a_share = 1.0 / (1.0 + math.exp(-0.85 * diff))
+    a_win = remaining * a_share
+    b_win = remaining * (1.0 - a_share)
+
+    return {
+        "team_a_win_pct": round(a_win * 100, 1),
+        "draw_pct": round(draw * 100, 1),
+        "team_b_win_pct": round(b_win * 100, 1),
+    }
+
+
+def _predicted_scoreline(form_a: dict, form_b: dict, probs: dict):
+    attack_a = form_a.get("avg_xg_for") or form_a.get("goals_for_per_match") or 1.2
+    defense_b = form_b.get("avg_xg_against") or form_b.get("goals_against_per_match") or 1.2
+    attack_b = form_b.get("avg_xg_for") or form_b.get("goals_for_per_match") or 1.2
+    defense_a = form_a.get("avg_xg_against") or form_a.get("goals_against_per_match") or 1.2
+
+    expected_a = max(0.2, min(4.0, (attack_a + defense_b) / 2))
+    expected_b = max(0.2, min(4.0, (attack_b + defense_a) / 2))
+
+    goals_a = int(round(expected_a))
+    goals_b = int(round(expected_b))
+
+    # Break an accidental draw toward the higher win probability.
+    if goals_a == goals_b:
+        if probs["team_a_win_pct"] - probs["team_b_win_pct"] >= 8:
+            goals_a += 1
+        elif probs["team_b_win_pct"] - probs["team_a_win_pct"] >= 8:
+            goals_b += 1
+
+    return {
+        "team_a_goals": goals_a,
+        "team_b_goals": goals_b,
+        "expected_goals_proxy": {
+            "team_a": round(expected_a, 2),
+            "team_b": round(expected_b, 2),
+        },
+    }
+
+
+async def _build_team_recent_dataset(team: dict, match_limit: int):
+    team_id = team.get("id")
+    name = team.get("name")
+
+    results_data = await flashscore_get(
+        "/teams/results",
+        {"team": team_id, "page": 1},
+    )
+    recent_raw = _flatten_team_results(results_data)[:match_limit]
+
+    async def enrich(match):
+        compact = _compact_match(match, team_id=team_id)
+        if not match.get("has_statistics") or not match.get("id"):
+            compact["statistics"] = None
+            return compact
+        try:
+            stats = await flashscore_get(
+                "/matches/statistics",
+                {"match": match.get("id")},
+            )
+            compact["statistics"] = _compact_match_statistics(
+                stats,
+                team_side=compact.get("team_side"),
+            )
+        except Exception as exc:
+            compact["statistics"] = {"error": type(exc).__name__}
+        return compact
+
+    enriched = await asyncio.gather(*(enrich(m) for m in recent_raw))
+
+    latest_players = None
+    if recent_raw and recent_raw[0].get("id"):
+        try:
+            raw_players = await flashscore_get(
+                "/matches/player-statistics",
+                {"match": recent_raw[0].get("id")},
+            )
+            latest_players = _compact_player_statistics(
+                raw_players,
+                team_id=team_id,
+                team_name=name,
+                max_players=25,
+            )
+        except Exception as exc:
+            latest_players = {"error": type(exc).__name__}
+
+    form = _aggregate_team_form(enriched)
+    profile = _profile_strengths_weaknesses(form)
+
+    return {
+        "team": team,
+        "recent_matches": enriched,
+        "form": form,
+        "profile": profile,
+        "key_players_latest_match": _key_players_from_compact(latest_players),
+        "latest_match_player_statistics": latest_players,
+    }
+
+
 @mcp.tool()
 def ping() -> str:
     """Check whether the Flashscore MCP server is running."""
@@ -1042,6 +1371,196 @@ async def analyze_team_recent_matches(
             "latest_match_player_statistics for the latest-match player view. "
             "Never infer that a player was unused only because rating is null; "
             "use each player's played/participation field."
+        ),
+    }
+
+
+@mcp.tool()
+async def analyze_matchup(
+    team_a: str,
+    team_b: str,
+    matches: int = 5,
+    country_a: str | None = None,
+    country_b: str | None = None,
+):
+    """
+    Build one bounded pre-match analysis dataset for two football teams.
+
+    Use this when the user asks who is stronger, each team's strengths and
+    weaknesses, how their styles match up, what could decide the game, which
+    players matter most, and a reasoned prediction for their next meeting.
+
+    The tool resolves both teams, analyzes recent matches across competitions,
+    looks for their next direct fixture, attaches injuries/suspensions and H2H
+    when that fixture is available, and returns a transparent heuristic
+    prediction. The prediction is an estimate, not a certainty.
+    """
+    match_limit = max(3, min(int(matches), 8))
+
+    (resolved_a, alternatives_a), (resolved_b, alternatives_b) = await asyncio.gather(
+        _resolve_team(team_a, country_a),
+        _resolve_team(team_b, country_b),
+    )
+
+    if not resolved_a or not resolved_b:
+        return {
+            "error": "team_not_found",
+            "team_a": team_a,
+            "team_b": team_b,
+            "resolved_team_a": resolved_a,
+            "resolved_team_b": resolved_b,
+        }
+
+    dataset_a, dataset_b, fixtures_a, fixtures_b = await asyncio.gather(
+        _build_team_recent_dataset(resolved_a, match_limit),
+        _build_team_recent_dataset(resolved_b, match_limit),
+        flashscore_get("/teams/fixtures", {"team": resolved_a.get("id"), "page": 1}),
+        flashscore_get("/teams/fixtures", {"team": resolved_b.get("id"), "page": 1}),
+    )
+
+    direct_fixture = _find_direct_fixture(
+        fixtures_a,
+        fixtures_b,
+        resolved_a.get("id"),
+        resolved_b.get("id"),
+    )
+
+    fixture = _compact_match(direct_fixture) if direct_fixture else None
+    home_side = None
+    if direct_fixture:
+        home = direct_fixture.get("home") or {}
+        home_id = home.get("id") if isinstance(home, dict) else None
+        if str(home_id) == str(resolved_a.get("id")):
+            home_side = "a"
+        elif str(home_id) == str(resolved_b.get("id")):
+            home_side = "b"
+
+    missing_players = None
+    h2h = None
+    if direct_fixture and direct_fixture.get("id"):
+        match_id = direct_fixture.get("id")
+        missing_players, h2h = await asyncio.gather(
+            flashscore_get("/matches/missing-players", {"match": match_id}),
+            flashscore_get("/matches/h2h", {"match": match_id}),
+            return_exceptions=True,
+        )
+        if isinstance(missing_players, Exception):
+            missing_players = {"error": type(missing_players).__name__}
+        if isinstance(h2h, Exception):
+            h2h = {"error": type(h2h).__name__}
+
+    score_a = _prediction_score(dataset_a["form"])
+    score_b = _prediction_score(dataset_b["form"])
+    probabilities = _prediction_probabilities(score_a, score_b, home_side)
+    scoreline = _predicted_scoreline(
+        dataset_a["form"],
+        dataset_b["form"],
+        probabilities,
+    )
+
+    tactical_edges = []
+    a_form = dataset_a["form"]
+    b_form = dataset_b["form"]
+
+    if (
+        a_form.get("avg_possession") is not None
+        and b_form.get("avg_possession") is not None
+    ):
+        possession_gap = a_form["avg_possession"] - b_form["avg_possession"]
+        if possession_gap >= 8:
+            tactical_edges.append({
+                "edge": "team_a_possession_control",
+                "explanation": (
+                    f"{resolved_a.get('name')} has the stronger recent possession "
+                    "profile and is more likely to control territory."
+                ),
+            })
+        elif possession_gap <= -8:
+            tactical_edges.append({
+                "edge": "team_b_possession_control",
+                "explanation": (
+                    f"{resolved_b.get('name')} has the stronger recent possession "
+                    "profile and is more likely to control territory."
+                ),
+            })
+
+    if (
+        a_form.get("avg_xg_for") is not None
+        and b_form.get("avg_xg_against") is not None
+        and a_form["avg_xg_for"] >= 2.0
+        and b_form["avg_xg_against"] >= 1.3
+    ):
+        tactical_edges.append({
+            "edge": "team_a_chance_creation_vs_team_b_defense",
+            "explanation": (
+                f"{resolved_a.get('name')}'s recent chance creation directly targets "
+                f"a defensive weakness in {resolved_b.get('name')}."
+            ),
+        })
+
+    if (
+        b_form.get("avg_xg_for") is not None
+        and a_form.get("avg_xg_against") is not None
+        and b_form["avg_xg_for"] >= 2.0
+        and a_form["avg_xg_against"] >= 1.3
+    ):
+        tactical_edges.append({
+            "edge": "team_b_chance_creation_vs_team_a_defense",
+            "explanation": (
+                f"{resolved_b.get('name')}'s recent chance creation directly targets "
+                f"a defensive weakness in {resolved_a.get('name')}."
+            ),
+        })
+
+    return {
+        "query": {
+            "team_a": team_a,
+            "team_b": team_b,
+            "matches": match_limit,
+            "country_a": country_a,
+            "country_b": country_b,
+        },
+        "resolved_team_a": resolved_a,
+        "resolved_team_b": resolved_b,
+        "alternative_team_a_matches": alternatives_a[1:],
+        "alternative_team_b_matches": alternatives_b[1:],
+        "next_direct_fixture": fixture,
+        "team_a_analysis": dataset_a,
+        "team_b_analysis": dataset_b,
+        "availability_for_next_fixture": missing_players,
+        "head_to_head_for_next_fixture": h2h,
+        "tactical_matchup": {
+            "data_driven_edges": tactical_edges,
+            "coach_analysis_guidance": (
+                "Explain the coaching matchup through observable tactical profiles "
+                "from the recent-match data. Do not invent a coach name, formation, "
+                "or tactical preference that is not present in the tool data. "
+                "Frame manager advantages as conditional: what each side needs to "
+                "do to exploit the opponent's measurable weaknesses."
+            ),
+        },
+        "prediction": {
+            "method": (
+                "Transparent heuristic using recent points-per-match, goal difference, "
+                "xG difference when available, shot differential, and a small home "
+                "advantage when the direct fixture is known."
+            ),
+            "team_a_model_score": round(score_a, 3),
+            "team_b_model_score": round(score_b, 3),
+            "probabilities": probabilities,
+            "predicted_scoreline": scoreline,
+            "confidence_note": (
+                "This is a data-based estimate, not a guaranteed result. Claude should "
+                "explain the main factors that could invalidate the prediction, "
+                "especially injuries, rotation, red cards, and tactical changes."
+            ),
+        },
+        "response_guidance": (
+            "For the final answer: compare strengths and weaknesses, explain the "
+            "tactical matchup in detail, identify key players and availability, "
+            "describe how each coaching approach could gain an edge using only "
+            "observable data, then give win/draw/loss probabilities and one predicted "
+            "score. Distinguish measured facts from interpretation."
         ),
     }
 
