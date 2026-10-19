@@ -319,6 +319,20 @@ def _compact_player_entry(player_entry: dict):
         if len(selected_stats) >= 24:
             break
 
+    minutes_played = None
+    for key, value in selected_stats.items():
+        if "minute" in _normalized(key):
+            if isinstance(value, (int, float)):
+                minutes_played = value
+                break
+
+    if minutes_played is not None:
+        participation = "played" if minutes_played > 0 else "unused"
+    elif player_entry.get("rating") is not None:
+        participation = "played"
+    else:
+        participation = "unknown"
+
     return {
         "player_id": player.get("id") if isinstance(player, dict) else None,
         "name": player.get("name") if isinstance(player, dict) else player,
@@ -330,6 +344,8 @@ def _compact_player_entry(player_entry: dict):
         "is_starter": player_entry.get("is_starter"),
         "rating": player_entry.get("rating"),
         "is_best_rated": player_entry.get("is_best_rated"),
+        "minutes_played": minutes_played,
+        "participation": participation,
         "statistics": selected_stats,
     }
 
@@ -435,15 +451,107 @@ async def get_team_squad(team_id: str):
     )
 
 
+def _lineup_player_ids(side_payload: dict):
+    ids = []
+    for group in side_payload.get("groups", []) or []:
+        for item in group.get("players", []) or []:
+            player = item.get("player") or {}
+            player_id = player.get("id") if isinstance(player, dict) else None
+            if player_id:
+                ids.append(str(player_id))
+    return ids
+
+
+def _normalize_lineup_sides(details: dict, lineups: dict, player_stats: dict):
+    """
+    Repair mislabeled home/away lineup groups by matching player IDs against
+    the player-statistics team assignments. Falls back to the raw side when
+    there is not enough evidence.
+    """
+    home_team = details.get("home") or {}
+    away_team = details.get("away") or {}
+    home_team_id = str(home_team.get("id") or "")
+    away_team_id = str(away_team.get("id") or "")
+
+    player_team = {}
+    for entry in player_stats.get("players", []) or []:
+        player = entry.get("player") or {}
+        team = entry.get("team") or {}
+        pid = player.get("id") if isinstance(player, dict) else None
+        tid = team.get("id") if isinstance(team, dict) else None
+        if pid and tid:
+            player_team[str(pid)] = str(tid)
+
+    raw_sides = {
+        "home": lineups.get("home") or {"formation": None, "rating": None, "groups": []},
+        "away": lineups.get("away") or {"formation": None, "rating": None, "groups": []},
+    }
+
+    mapped = {}
+    evidence = {}
+
+    for raw_name, payload in raw_sides.items():
+        counts = {home_team_id: 0, away_team_id: 0}
+        for pid in _lineup_player_ids(payload):
+            tid = player_team.get(pid)
+            if tid in counts:
+                counts[tid] += 1
+
+        evidence[raw_name] = counts
+        best_team_id = max(counts, key=counts.get) if counts else ""
+        best_count = counts.get(best_team_id, 0)
+
+        if best_count > 0 and best_team_id == home_team_id:
+            mapped["home"] = payload
+        elif best_count > 0 and best_team_id == away_team_id:
+            mapped["away"] = payload
+        else:
+            mapped.setdefault(raw_name, payload)
+
+    mapped.setdefault("home", raw_sides["home"])
+    mapped.setdefault("away", raw_sides["away"])
+
+    return {
+        "id": details.get("id") or lineups.get("id"),
+        "date": details.get("date") or lineups.get("date"),
+        "home_score": details.get("home_score"),
+        "away_score": details.get("away_score"),
+        "home_team": home_team,
+        "away_team": away_team,
+        "home": mapped["home"],
+        "away": mapped["away"],
+        "side_mapping_evidence": evidence,
+        "mapping_note": (
+            "home/away lineup sides were verified against player-statistics "
+            "team IDs. Use home_team/away_team as the authoritative identity."
+        ),
+    }
+
+
 @mcp.tool()
 async def get_match_lineups(match_id: str):
-    """Get match lineups and formations."""
-    return await flashscore_get(
-        "/matches/lineups",
-        {
-            "match": match_id,
-        },
+    """
+    Get match lineups and formations with corrected home/away assignment.
+
+    The raw Flashscore lineup feed can occasionally label the two sides in the
+    opposite order. This tool cross-checks player IDs against player-statistics
+    team IDs and also returns the full match summary incidents so goals, cards,
+    substitutions and assists are not inferred from partial lineup markers.
+    """
+    details, lineups, player_stats, summary = await asyncio.gather(
+        flashscore_get("/matches/details", {"match": match_id}),
+        flashscore_get("/matches/lineups", {"match": match_id}),
+        flashscore_get("/matches/player-statistics", {"match": match_id}),
+        flashscore_get("/matches/summary", {"match": match_id}),
     )
+
+    normalized = _normalize_lineup_sides(details, lineups, player_stats)
+    normalized["summary"] = summary
+    normalized["summary_note"] = (
+        "Use summary.periods[].incidents as the authoritative event list. "
+        "Lineup player incident markers are partial annotations only."
+    )
+    return normalized
 
 
 @mcp.tool()
