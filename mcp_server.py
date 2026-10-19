@@ -328,10 +328,13 @@ def _compact_player_entry(player_entry: dict):
 
     if minutes_played is not None:
         participation = "played" if minutes_played > 0 else "unused"
+        played = minutes_played > 0
     elif player_entry.get("rating") is not None:
         participation = "played"
+        played = True
     else:
         participation = "unknown"
+        played = None
 
     return {
         "player_id": player.get("id") if isinstance(player, dict) else None,
@@ -346,6 +349,11 @@ def _compact_player_entry(player_entry: dict):
         "is_best_rated": player_entry.get("is_best_rated"),
         "minutes_played": minutes_played,
         "participation": participation,
+        "played": played,
+        "rating_note": (
+            "A null rating does not prove the player was unused. "
+            "Use played/participation instead."
+        ),
         "statistics": selected_stats,
     }
 
@@ -451,65 +459,125 @@ async def get_team_squad(team_id: str):
     )
 
 
-def _lineup_player_ids(side_payload: dict):
-    ids = []
-    for group in side_payload.get("groups", []) or []:
-        for item in group.get("players", []) or []:
-            player = item.get("player") or {}
-            player_id = player.get("id") if isinstance(player, dict) else None
-            if player_id:
-                ids.append(str(player_id))
-    return ids
+def _raw_lineup_player_index(lineups: dict):
+    """Index raw lineup annotations by player ID, deduplicating duplicated sides."""
+    index = {}
+    raw_side_sets = {"home": set(), "away": set()}
+
+    for raw_side in ("home", "away"):
+        payload = lineups.get(raw_side) or {}
+        for group in payload.get("groups", []) or []:
+            for item in group.get("players", []) or []:
+                player = item.get("player") or {}
+                player_id = player.get("id") if isinstance(player, dict) else None
+                if not player_id:
+                    continue
+                player_id = str(player_id)
+                raw_side_sets[raw_side].add(player_id)
+                index.setdefault(player_id, item)
+
+    return index, raw_side_sets
 
 
-def _normalize_lineup_sides(details: dict, lineups: dict, player_stats: dict):
+def _authoritative_lineups(details: dict, lineups: dict, player_stats: dict):
     """
-    Repair mislabeled home/away lineup groups by matching player IDs against
-    the player-statistics team assignments. Falls back to the raw side when
-    there is not enough evidence.
+    Rebuild the two team lineups from player-statistics team IDs.
+
+    The raw Flashscore lineup feed can duplicate or reverse its home/away
+    groups. Team membership from player-statistics is more reliable, so raw
+    lineup data is used only as optional per-player annotation.
     """
     home_team = details.get("home") or {}
     away_team = details.get("away") or {}
     home_team_id = str(home_team.get("id") or "")
     away_team_id = str(away_team.get("id") or "")
 
-    player_team = {}
-    for entry in player_stats.get("players", []) or []:
-        player = entry.get("player") or {}
-        team = entry.get("team") or {}
-        pid = player.get("id") if isinstance(player, dict) else None
-        tid = team.get("id") if isinstance(team, dict) else None
-        if pid and tid:
-            player_team[str(pid)] = str(tid)
+    raw_index, raw_side_sets = _raw_lineup_player_index(lineups)
 
-    raw_sides = {
-        "home": lineups.get("home") or {"formation": None, "rating": None, "groups": []},
-        "away": lineups.get("away") or {"formation": None, "rating": None, "groups": []},
+    rebuilt = {
+        "home": {
+            "team": home_team,
+            "formation": None,
+            "team_rating": None,
+            "groups": [
+                {"name": "Starting XI", "players": []},
+                {"name": "Substitutes / other squad", "players": []},
+            ],
+        },
+        "away": {
+            "team": away_team,
+            "formation": None,
+            "team_rating": None,
+            "groups": [
+                {"name": "Starting XI", "players": []},
+                {"name": "Substitutes / other squad", "players": []},
+            ],
+        },
     }
 
-    mapped = {}
-    evidence = {}
+    assigned = {"home": 0, "away": 0}
+    unassigned = []
 
-    for raw_name, payload in raw_sides.items():
-        counts = {home_team_id: 0, away_team_id: 0}
-        for pid in _lineup_player_ids(payload):
-            tid = player_team.get(pid)
-            if tid in counts:
-                counts[tid] += 1
+    for entry in player_stats.get("players", []) or []:
+        player_ref = entry.get("player") or {}
+        team_ref = entry.get("team") or {}
+        player_id = player_ref.get("id") if isinstance(player_ref, dict) else None
+        team_id = team_ref.get("id") if isinstance(team_ref, dict) else None
 
-        evidence[raw_name] = counts
-        best_team_id = max(counts, key=counts.get) if counts else ""
-        best_count = counts.get(best_team_id, 0)
+        if not player_id:
+            continue
 
-        if best_count > 0 and best_team_id == home_team_id:
-            mapped["home"] = payload
-        elif best_count > 0 and best_team_id == away_team_id:
-            mapped["away"] = payload
+        player_id = str(player_id)
+        team_id = str(team_id or "")
+        raw = raw_index.get(player_id) or {}
+
+        if team_id == home_team_id:
+            side = "home"
+        elif team_id == away_team_id:
+            side = "away"
         else:
-            mapped.setdefault(raw_name, payload)
+            unassigned.append({
+                "player_id": player_id,
+                "player": player_ref,
+                "team": team_ref,
+            })
+            continue
 
-    mapped.setdefault("home", raw_sides["home"])
-    mapped.setdefault("away", raw_sides["away"])
+        rating = entry.get("rating")
+        if rating is None:
+            rating = raw.get("rating")
+
+        player = {
+            "player": player_ref,
+            "team": team_ref,
+            "shirt_number": raw.get("shirt_number"),
+            "surname": raw.get("surname"),
+            "country": raw.get("country"),
+            "position": entry.get("position"),
+            "role": raw.get("role"),
+            "is_captain": raw.get("is_captain"),
+            "is_goalkeeper": entry.get("is_goalkeeper"),
+            "is_starter": entry.get("is_starter"),
+            "rating": rating,
+            "is_best_rated": entry.get("is_best_rated"),
+            "raw_lineup_incident": raw.get("incident"),
+        }
+
+        group_index = 0 if entry.get("is_starter") else 1
+        rebuilt[side]["groups"][group_index]["players"].append(player)
+        assigned[side] += 1
+
+    # Raw formation/team rating is safe only when the two raw sides are
+    # clearly different. If they are duplicates/near-duplicates, omit them.
+    overlap = len(raw_side_sets["home"] & raw_side_sets["away"])
+    smaller = min(len(raw_side_sets["home"]), len(raw_side_sets["away"])) or 1
+    overlap_ratio = overlap / smaller
+
+    if overlap_ratio < 0.25:
+        for side in ("home", "away"):
+            raw_side = lineups.get(side) or {}
+            rebuilt[side]["formation"] = raw_side.get("formation")
+            rebuilt[side]["team_rating"] = raw_side.get("rating")
 
     return {
         "id": details.get("id") or lineups.get("id"),
@@ -518,12 +586,135 @@ def _normalize_lineup_sides(details: dict, lineups: dict, player_stats: dict):
         "away_score": details.get("away_score"),
         "home_team": home_team,
         "away_team": away_team,
-        "home": mapped["home"],
-        "away": mapped["away"],
-        "side_mapping_evidence": evidence,
+        "home": rebuilt["home"],
+        "away": rebuilt["away"],
+        "lineup_quality": {
+            "assignment_source": "player_statistics.team.id",
+            "home_players_assigned": assigned["home"],
+            "away_players_assigned": assigned["away"],
+            "unassigned_players": unassigned,
+            "raw_home_player_count": len(raw_side_sets["home"]),
+            "raw_away_player_count": len(raw_side_sets["away"]),
+            "raw_side_overlap_count": overlap,
+            "raw_side_overlap_ratio": round(overlap_ratio, 3),
+            "raw_formation_and_team_rating_used": overlap_ratio < 0.25,
+        },
         "mapping_note": (
-            "home/away lineup sides were verified against player-statistics "
-            "team IDs. Use home_team/away_team as the authoritative identity."
+            "home/away player membership is rebuilt from player-statistics "
+            "team IDs. Raw lineup sides are never used as team identity."
+        ),
+    }
+
+
+def _normalize_match_summary(details: dict, summary: dict):
+    """
+    Attach authoritative team identity to incidents and surface score conflicts
+    instead of guessing when upstream period headers disagree with incidents.
+    """
+    home_team = details.get("home") or {}
+    away_team = details.get("away") or {}
+
+    normalized_periods = []
+    all_incidents = []
+
+    for period_index, period in enumerate(summary.get("periods", []) or []):
+        normalized_incidents = []
+        for incident in period.get("incidents", []) or []:
+            item = dict(incident)
+            raw_side = item.get("team")
+
+            if raw_side == "home":
+                item["team_id"] = home_team.get("id")
+                item["team_name"] = home_team.get("name")
+            elif raw_side == "away":
+                item["team_id"] = away_team.get("id")
+                item["team_name"] = away_team.get("name")
+            else:
+                item["team_id"] = None
+                item["team_name"] = None
+
+            item["_period_index"] = period_index
+            normalized_incidents.append(item)
+            all_incidents.append(item)
+
+        normalized_periods.append({
+            "period": period.get("period"),
+            "raw_home_score_at_start": period.get("home_score_at_start"),
+            "raw_away_score_at_start": period.get("away_score_at_start"),
+            "incidents": normalized_incidents,
+        })
+
+    # Derive the score observed at the end of each period from incidents only.
+    period_end_scores = []
+    for period in normalized_periods:
+        scored = [
+            i for i in period["incidents"]
+            if i.get("home_score") is not None and i.get("away_score") is not None
+        ]
+        last = scored[-1] if scored else None
+        period_end_scores.append({
+            "period": period.get("period"),
+            "incident_derived_end_score": (
+                {
+                    "home": last.get("home_score"),
+                    "away": last.get("away_score"),
+                }
+                if last else None
+            ),
+            "raw_reported_score_at_period_header": {
+                "home": period.get("raw_home_score_at_start"),
+                "away": period.get("raw_away_score_at_start"),
+            },
+        })
+
+    scored_incidents = [
+        i for i in all_incidents
+        if i.get("home_score") is not None and i.get("away_score") is not None
+    ]
+    last_incident = scored_incidents[-1] if scored_incidents else None
+
+    final_score = {
+        "home": details.get("home_score"),
+        "away": details.get("away_score"),
+    }
+    incident_last_score = (
+        {
+            "home": last_incident.get("home_score"),
+            "away": last_incident.get("away_score"),
+        }
+        if last_incident else None
+    )
+
+    warnings = []
+    if incident_last_score and incident_last_score != final_score:
+        warnings.append(
+            "Incident list does not reach the official final score; one or more "
+            "scoring incidents may be missing."
+        )
+
+    if len(period_end_scores) >= 2:
+        first_end = period_end_scores[0].get("incident_derived_end_score")
+        second_header = period_end_scores[1].get("raw_reported_score_at_period_header")
+        if first_end and second_header and first_end != second_header:
+            warnings.append(
+                "First-half incident-derived score conflicts with the raw "
+                "second-period header score. Do not infer halftime score."
+            )
+
+    return {
+        "id": summary.get("id") or details.get("id"),
+        "home_team": home_team,
+        "away_team": away_team,
+        "final_score": final_score,
+        "periods": normalized_periods,
+        "period_score_checks": period_end_scores,
+        "incident_last_score": incident_last_score,
+        "score_consistent_with_final": incident_last_score == final_score if incident_last_score else None,
+        "data_quality_warnings": warnings,
+        "usage_note": (
+            "Use incident team_id/team_name for event ownership. "
+            "Do not treat raw period header scores as authoritative when "
+            "data_quality_warnings reports a conflict."
         ),
     }
 
@@ -531,12 +722,12 @@ def _normalize_lineup_sides(details: dict, lineups: dict, player_stats: dict):
 @mcp.tool()
 async def get_match_lineups(match_id: str):
     """
-    Get match lineups and formations with corrected home/away assignment.
+    Get reconstructed team lineups plus a normalized incident summary.
 
-    The raw Flashscore lineup feed can occasionally label the two sides in the
-    opposite order. This tool cross-checks player IDs against player-statistics
-    team IDs and also returns the full match summary incidents so goals, cards,
-    substitutions and assists are not inferred from partial lineup markers.
+    Team membership is rebuilt from player-statistics team IDs because the raw
+    lineup feed can duplicate or reverse sides. Formation/team rating is
+    omitted when the raw sides overlap heavily. Match incidents are normalized
+    to authoritative team IDs, and score conflicts are surfaced explicitly.
     """
     details, lineups, player_stats, summary = await asyncio.gather(
         flashscore_get("/matches/details", {"match": match_id}),
@@ -545,11 +736,12 @@ async def get_match_lineups(match_id: str):
         flashscore_get("/matches/summary", {"match": match_id}),
     )
 
-    normalized = _normalize_lineup_sides(details, lineups, player_stats)
-    normalized["summary"] = summary
+    normalized = _authoritative_lineups(details, lineups, player_stats)
+    normalized["summary"] = _normalize_match_summary(details, summary)
     normalized["summary_note"] = (
-        "Use summary.periods[].incidents as the authoritative event list. "
-        "Lineup player incident markers are partial annotations only."
+        "Use summary.periods[].incidents team_id/team_name for event ownership. "
+        "If summary.data_quality_warnings is non-empty, report the conflict "
+        "rather than guessing which upstream score source is correct."
     )
     return normalized
 
@@ -694,7 +886,9 @@ async def analyze_team_recent_matches(
             "For each match, team_score/opponent_score and every statistic's "
             "team/opponent fields are already normalized to the resolved team, "
             "so do not infer orientation from home/away. Use "
-            "latest_match_player_statistics for the latest-match player view."
+            "latest_match_player_statistics for the latest-match player view. "
+            "Never infer that a player was unused only because rating is null; "
+            "use each player's played/participation field."
         ),
     }
 
